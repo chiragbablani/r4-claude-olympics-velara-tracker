@@ -1,0 +1,40 @@
+# Secrets / credentials
+.env
+.env.*
+*.pem
+*.key
+*token*
+*secret*
+*credential*
+.netrc
+
+# Local data packs (never commit evaluation data)
+/pack/
+/packs/
+/data/
+/*_pack/
+*VELARA_tracker.xlsx
+*dashboard_status.csv
+
+# Outputs
+output.json
+*.out.json
+/outputs/
+
+# Python caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+.eggs/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
