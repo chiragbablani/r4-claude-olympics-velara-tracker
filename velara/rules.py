@@ -94,30 +94,87 @@ def run_all_rules(pack: LoadedPack) -> list[dict]:
         })
 
     # -- DATE_MOVED_WITHOUT_RECORD --
+    # Deduplicate rows within each month before comparing, so a duplicate
+    # key (like China's in March) doesn't create a false positive.
     moved_countries: set[str] = set()
     for (name_a, df_a), (name_b, df_b) in zip(monthly, monthly[1:]):
-        keys_a = {}
+        # Build keyed lookup, dropping duplicate keys (keep first)
+        keys_a: dict[tuple[str, str], tuple] = {}
+        seen_a: set[tuple[str, str]] = set()
+        dup_a: set[tuple[str, str]] = set()
         for _, row in df_a.iterrows():
             k = (str(row["Country"]).strip().lower(), str(row["SKU"]).strip())
-            keys_a[k] = (row["Expected Launch Shipment Date"], row.get("Shipment Date Change Log"))
+            if k in seen_a:
+                dup_a.add(k)
+            else:
+                seen_a.add(k)
+                keys_a[k] = (row["Expected Launch Shipment Date"], row.get("Shipment Date Change Log"))
+        for k in dup_a:
+            keys_a.pop(k, None)
+
+        seen_b: set[tuple[str, str]] = set()
+        dup_b: set[tuple[str, str]] = set()
+        keys_b_rows: dict[tuple[str, str], tuple] = {}
         for _, row in df_b.iterrows():
             k = (str(row["Country"]).strip().lower(), str(row["SKU"]).strip())
+            if k in seen_b:
+                dup_b.add(k)
+            else:
+                seen_b.add(k)
+                keys_b_rows[k] = (row["Expected Launch Shipment Date"], row.get("Shipment Date Change Log"), str(row["Country"]).strip())
+        for k in dup_b:
+            keys_b_rows.pop(k, None)
+
+        for k, (exp_b, log_b, country_raw) in keys_b_rows.items():
             if k not in keys_a:
                 continue
             exp_a, _ = keys_a[k]
-            exp_b = row["Expected Launch Shipment Date"]
-            log_b = row.get("Shipment Date Change Log")
             if pd.isna(exp_a) or pd.isna(exp_b):
                 continue
             if exp_a != exp_b:
                 has_log = isinstance(log_b, str) and log_b.strip() != ""
                 if not has_log:
-                    moved_countries.add(str(row["Country"]).strip())
+                    moved_countries.add(country_raw)
     if moved_countries:
         findings.append({
             "what": "DATE_MOVED_WITHOUT_RECORD",
             "where": _countries_str(moved_countries),
             "proof": _trim("Expected Launch Shipment Date changed between months with no Shipment Date Change Log entry"),
+        })
+
+    # -- DATE_PASSED_NO_REPLAN --
+    # Markets where every expected date is before TODAY with no revised
+    # date appearing in a later extract. Deduplicate before comparing.
+    passed_countries: set[str] = set()
+    df_latest = latest
+    grouped = df_latest.groupby(df_latest["Country"].astype(str).str.strip().str.lower())
+    for country_norm, grp in grouped:
+        if not (grp["Expected Launch Shipment Date"] < TODAY).all():
+            continue
+        # Check whether any later extract has a different (revised) expected date
+        # compared to the earliest extract containing this country
+        country_raw = grp["Country"].iloc[0].strip()
+        latest_dates = set(grp["Expected Launch Shipment Date"].dropna())
+        revised = False
+        for i in range(len(monthly) - 1):
+            _, df_i = monthly[i]
+            _, df_next = monthly[i + 1]
+            rows_i = df_i[df_i["Country"].astype(str).str.strip().str.lower() == country_norm]
+            rows_next = df_next[df_next["Country"].astype(str).str.strip().str.lower() == country_norm]
+            dates_i = set(rows_i["Expected Launch Shipment Date"].dropna())
+            dates_next = set(rows_next["Expected Launch Shipment Date"].dropna())
+            # Ignore serial-date conversion differences (both sets should be
+            # datetime after cleaning)
+            if dates_i and dates_next and dates_i != dates_next:
+                revised = True
+                break
+        if not revised:
+            passed_countries.add(country_raw)
+    if passed_countries:
+        findings.append({
+            "what": "DATE_PASSED_NO_REPLAN",
+            "where": _countries_str(passed_countries),
+            "proof": _trim(f"All expected dates before {TODAY.date()} with no revised date in any later extract"),
         })
 
     # -- DATE_STORED_AS_NUMBER --

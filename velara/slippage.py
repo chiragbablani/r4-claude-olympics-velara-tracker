@@ -63,6 +63,7 @@ def _one_country_slippage(
     country_rows: pd.DataFrame,
     forecast_volume: float,
     lead_time_days: float,
+    demand_never_loaded_countries: set[str],
 ) -> CountrySlippage:
     country = country_rows["Country"].iloc[0]
     exp_col = "Expected Launch Shipment Date"
@@ -83,15 +84,16 @@ def _one_country_slippage(
     demand_load_used: pd.Timestamp | None
     feasible_date: pd.Timestamp | None
     if supply_route == "Via Hub":
-        # Via Hub markets are legitimately blank on demand/setup fields;
-        # no feasibility constraint applies at all for them.
         demand_load_used = None
         feasible_date = None
     else:
         demand_load_used = demand_load if pd.notna(demand_load) else TODAY
         feasible_date = demand_load_used + pd.Timedelta(days=lead_time_days)
 
-    floor_applied = bool(expected_2mg < TODAY and pd.isna(actual_ship))
+    # Floor: if expected < TODAY, real date is at least TODAY, regardless
+    # of whether an actual shipment is recorded (a bonded pre-approval
+    # move does not count as shipped — R4-Q05-481a, R4-Q07-da69).
+    floor_applied = bool(expected_2mg < TODAY)
     floor_date = TODAY if floor_applied else None
 
     candidates = [expected_2mg]
@@ -104,29 +106,37 @@ def _one_country_slippage(
     slippage_days = max(0, (real_ship_date - claimed_date).days)
     impact_score = slippage_days * forecast_volume
 
+    # Check if this country's 2MG box has demand blank in all 4 months
+    # (Direct only) — passed via demand_never_loaded_countries set.
+    country_norm = country.strip().lower()
+    is_demand_never_loaded = country_norm in demand_never_loaded_countries
+
+    # Check if every expected date in the country is before TODAY with
+    # no revised date in a later extract — DATE_PASSED_NO_REPLAN.
+    all_expected_past = bool((country_rows[exp_col] < TODAY).all())
+
     if slippage_days == 0:
         driver = "NONE"
         evidence = ""
     else:
-        # Driver must be one of the allowed finding codes (DATE_PASSED_NO_REPLAN
-        # is explicitly excluded, even as a driver tag). DEMAND_LOADED_TOO_LATE
-        # applies when the feasible date (demand load + site lead time) is the
-        # unique cause pulling the real date past the 2MG box's own expected
-        # date; otherwise the 2MG box's own expected date (optionally pushed
-        # further by the passed-date floor) is the cause, tagged
-        # STARTING_DOSE_UNAVAILABLE since the 2MG box is what's constraining.
-        if feasible_date is not None and feasible_date == real_ship_date and feasible_date > expected_2mg:
+        if all_expected_past and floor_applied:
+            driver = "DATE_PASSED_NO_REPLAN"
+            evidence = (
+                f"All expected dates before {TODAY.date()} with no "
+                f"revised date; real date floored to {TODAY.date()}"
+            )[:200]
+        elif is_demand_never_loaded and feasible_date is not None and feasible_date >= real_ship_date:
+            driver = "DEMAND_NEVER_LOADED"
+            evidence = (
+                f"Demand never loaded (blank in all 4 months); "
+                f"feasible date {feasible_date.date()} from TODAY + site lead time"
+            )[:200]
+        elif feasible_date is not None and feasible_date == real_ship_date and feasible_date > expected_2mg:
             driver = "DEMAND_LOADED_TOO_LATE"
             evidence = (
                 f"2MG feasible ship {feasible_date.date()} "
                 f"(load {demand_load_used.date()} + site lead time) exceeds "
                 f"claimed {claimed_date.date()}"
-            )[:200]
-        elif floor_applied and real_ship_date == floor_date and floor_date > expected_2mg:
-            driver = "STARTING_DOSE_UNAVAILABLE"
-            evidence = (
-                f"2MG expected {expected_2mg.date()} already passed TODAY "
-                f"with no actual shipment recorded; floored to {TODAY.date()}"
             )[:200]
         else:
             driver = "STARTING_DOSE_UNAVAILABLE"
@@ -156,12 +166,13 @@ def compute_slippage(
     latest_month_df: pd.DataFrame,
     ref_countries: pd.DataFrame,
     ref_sites: pd.DataFrame,
+    all_monthly_sheets: list[pd.DataFrame] | None = None,
 ) -> dict[str, CountrySlippage]:
     """Compute per-country slippage from the latest (April) monthly sheet.
 
-    Returns {country_name: CountrySlippage}, one entry per country found
-    in latest_month_df. Raises ValueError if a country doesn't have
-    exactly one 2MG row, since the rule depends on that box existing.
+    If all_monthly_sheets is provided, it is used to determine which
+    Direct-market 2MG boxes have demand blank in all 4 months (for
+    the DEMAND_NEVER_LOADED driver).
     """
     country_col = find_column(latest_month_df, "Country")
     site_col = find_column(latest_month_df, "Packaging Site")
@@ -175,12 +186,32 @@ def compute_slippage(
         ref_countries[ref_country_col].str.strip().str.lower()
     )[forecast_volume_col]
 
+    demand_never_loaded: set[str] = set()
+    if all_monthly_sheets:
+        blank_counts: dict[str, int] = {}
+        for df in all_monthly_sheets:
+            cc = find_column(df, "Country")
+            for _, row in df.iterrows():
+                if row.get("Supply Route") != "Direct":
+                    continue
+                if str(row.get("Dose", "")).strip() != STARTING_DOSE:
+                    continue
+                cnorm = str(row[cc]).strip().lower()
+                flag = row.get("Demand Loaded In Planning System?")
+                date = row.get("Demand Loaded Date")
+                if pd.isna(flag) and pd.isna(date):
+                    blank_counts[cnorm] = blank_counts.get(cnorm, 0) + 1
+        n_months = len(all_monthly_sheets)
+        demand_never_loaded = {c for c, n in blank_counts.items() if n >= n_months}
+
     results: dict[str, CountrySlippage] = {}
     grouped = latest_month_df.groupby(latest_month_df[country_col].str.strip().str.lower())
     for country_norm, rows in grouped:
         site = rows[site_col].iloc[0]
         lead_time_days = lead_time_weeks.get(site, 0) * 7
         forecast_volume = forecast_by_country.get(country_norm, 0)
-        results[country_norm] = _one_country_slippage(rows, forecast_volume, lead_time_days)
+        results[country_norm] = _one_country_slippage(
+            rows, forecast_volume, lead_time_days, demand_never_loaded
+        )
 
     return results

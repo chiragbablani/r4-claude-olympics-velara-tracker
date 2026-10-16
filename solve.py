@@ -61,7 +61,8 @@ def main() -> int:
         )
         latest = pack.tracker_sheets[monthly_names[-1]]
 
-        slippage = compute_slippage(latest, ref_countries, ref_sites)
+        all_monthly = [pack.tracker_sheets[n] for n in monthly_names]
+        slippage = compute_slippage(latest, ref_countries, ref_sites, all_monthly)
         risk_ranking = build_risk_ranking(slippage)
 
         findings = run_all_rules(pack)
