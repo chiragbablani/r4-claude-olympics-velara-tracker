@@ -11,7 +11,20 @@ Prints a plain-text report to stdout covering:
     - duplicate rows
     - date-like columns stored as text, and mixed date formats within a column
     - unexpected / inconsistent category values per column
-    - a month-to-month diff summary for matching row keys across sheets
+    - a month-to-month diff summary on the (Country, SKU) row key:
+      duplicate keys within a month, and keys missing/added between months
+
+Row key: each tracker row is one SKU in one country, so the row key is
+the composite (Country, SKU) pair — confirmed, not guessed. The country
+column is named "Country" in the tracker and Ref_Countries sheets, and
+"country" in dashboard_status.csv; matching is case-insensitive
+everywhere via velara.changes.find_column.
+
+Month-to-month diffing only runs between sheets whose name matches the
+tracker's monthly-tab pattern (e.g. "Tracker_2026_01"), so reference
+tabs (Ref_Countries, Ref_SKUs, Ref_Sites, Column Guide) are audited for
+blanks/duplicates/categories but are never paired against each other or
+against monthly tabs.
 
 This tool never writes to the pack folder or mutates any data; it only
 reads and prints. It is a human-facing exploration aid, separate from
@@ -25,6 +38,9 @@ from pathlib import Path
 
 import pandas as pd
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from velara.changes import find_column, find_duplicate_keys, key_structure_diff  # noqa: E402
+
 DATE_LIKE_PATTERNS = [
     re.compile(r"^\d{4}-\d{2}-\d{2}$"),          # 2026-01-31
     re.compile(r"^\d{1,2}/\d{1,2}/\d{2,4}$"),    # 1/31/2026 or 31/1/26
@@ -32,7 +48,7 @@ DATE_LIKE_PATTERNS = [
     re.compile(r"^[A-Za-z]{3,9} \d{1,2},? \d{4}$"),  # January 31, 2026
 ]
 
-CANDIDATE_KEY_NAMES = {"country", "country_code", "code", "market", "region"}
+MONTHLY_TAB_PATTERN = re.compile(r"^Tracker_\d{4}_\d{2}$", re.IGNORECASE)
 
 
 def section(title: str) -> None:
@@ -106,57 +122,41 @@ def audit_dataframe(name: str, df: pd.DataFrame) -> None:
             print(f"  {col}: {unique_vals}")
 
 
-def find_key_column(df: pd.DataFrame) -> str | None:
-    for col in df.columns:
-        if str(col).strip().lower() in CANDIDATE_KEY_NAMES:
-            return col
-    return None
+def _format_keys(keys: list[tuple[str, str]]) -> str:
+    if not keys:
+        return "(none)"
+    return ", ".join(f"({country!r}, {sku!r})" for country, sku in keys)
+
+
+def _format_dupes(dupes: dict[tuple[str, str], int]) -> str:
+    if not dupes:
+        return "(none)"
+    return ", ".join(f"({country!r}, {sku!r}) x{count}" for (country, sku), count in dupes.items())
 
 
 def diff_sheets(name_a: str, df_a: pd.DataFrame, name_b: str, df_b: pd.DataFrame) -> None:
-    key_a = find_key_column(df_a)
-    key_b = find_key_column(df_b)
     section(f"Month-to-month diff: {name_a} -> {name_b}")
+    print("  row key: (Country, SKU) — country matched case-insensitively")
 
-    if key_a is None or key_b is None or key_a != key_b:
-        print(
-            f"  skipped: could not find a matching row key column "
-            f"(candidates checked: {sorted(CANDIDATE_KEY_NAMES)})"
-        )
+    try:
+        diff = key_structure_diff(df_a, df_b)
+    except ValueError as exc:
+        print(f"  skipped: {exc}")
         return
 
-    key = key_a
-    keys_a = set(df_a[key].dropna().astype(str).str.strip())
-    keys_b = set(df_b[key].dropna().astype(str).str.strip())
+    print(f"  duplicate keys within {name_a}: {_format_dupes(diff.duplicate_keys_earlier)}")
+    print(f"  duplicate keys within {name_b}: {_format_dupes(diff.duplicate_keys_later)}")
+    print(f"  keys only in {name_a} (missing in {name_b}): {_format_keys(diff.only_in_earlier)}")
+    print(f"  keys only in {name_b} (missing in {name_a}): {_format_keys(diff.only_in_later)}")
 
-    only_in_a = sorted(keys_a - keys_b)
-    only_in_b = sorted(keys_b - keys_a)
-    common = sorted(keys_a & keys_b)
 
-    print(f"  key column: {key}")
-    print(f"  rows only in {name_a}: {only_in_a if only_in_a else '(none)'}")
-    print(f"  rows only in {name_b}: {only_in_b if only_in_b else '(none)'}")
-
-    shared_cols = [c for c in df_a.columns if c in df_b.columns and c != key]
-    if not shared_cols or not common:
-        print("  no shared non-key columns or no common rows to diff values on")
+def report_duplicate_keys_within_sheet(name: str, df: pd.DataFrame) -> None:
+    country_col = find_column(df, "Country")
+    sku_col = find_column(df, "SKU")
+    if country_col is None or sku_col is None:
         return
-
-    a_by_key = df_a.set_index(df_a[key].astype(str).str.strip())
-    b_by_key = df_b.set_index(df_b[key].astype(str).str.strip())
-
-    changed_count = 0
-    for row_key in common:
-        row_a = a_by_key.loc[row_key]
-        row_b = b_by_key.loc[row_key]
-        for col in shared_cols:
-            val_a = row_a[col] if not isinstance(row_a, pd.DataFrame) else row_a[col].iloc[0]
-            val_b = row_b[col] if not isinstance(row_b, pd.DataFrame) else row_b[col].iloc[0]
-            if pd.isna(val_a) and pd.isna(val_b):
-                continue
-            if str(val_a) != str(val_b):
-                changed_count += 1
-    print(f"  changed (key, column) cell values across common rows: {changed_count}")
+    dupes = find_duplicate_keys(df, country_col, sku_col)
+    print(f"\nduplicate (Country, SKU) keys within {name}: {_format_dupes(dupes)}")
 
 
 def main() -> int:
@@ -183,9 +183,11 @@ def main() -> int:
     for name, df in sheets.items():
         df.columns = [str(c).strip() for c in df.columns]
         audit_dataframe(f"tracker::{name}", df)
+        if MONTHLY_TAB_PATTERN.match(name):
+            report_duplicate_keys_within_sheet(f"tracker::{name}", df)
 
-    sheet_names = list(sheets.keys())
-    for earlier_name, later_name in zip(sheet_names, sheet_names[1:]):
+    monthly_names = [name for name in sheets if MONTHLY_TAB_PATTERN.match(name)]
+    for earlier_name, later_name in zip(monthly_names, monthly_names[1:]):
         diff_sheets(earlier_name, sheets[earlier_name], later_name, sheets[later_name])
 
     dashboard = pd.read_csv(dashboard_path)
