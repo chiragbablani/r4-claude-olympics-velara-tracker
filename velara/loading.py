@@ -41,6 +41,7 @@ _DATE_NAME_PATTERN = re.compile(r"date", re.IGNORECASE)
 class LoadedPack(NamedTuple):
     tracker_sheets: dict[str, pd.DataFrame]
     dashboard: pd.DataFrame
+    serial_date_columns: list[tuple[str, str]]  # (sheet_name, column_name) converted from int serial
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -95,23 +96,26 @@ def convert_serial_date_columns(
     return df, log_lines
 
 
-def load_tracker(tracker_path: Path) -> dict[str, pd.DataFrame]:
+def load_tracker(tracker_path: Path) -> tuple[dict[str, pd.DataFrame], list[tuple[str, str]]]:
     """Load every sheet of the tracker workbook.
 
-    Returns a dict of sheet_name -> DataFrame, columns normalized
-    (stripped of surrounding whitespace), with any integer-loaded Excel
-    serial date columns converted back to real dates. Conversions are
-    logged to stderr. No other row filtering or dtype coercion happens.
+    Returns (dict of sheet_name -> DataFrame, list of (sheet, col) pairs
+    that were converted from integer serial dates).
     """
     sheets = pd.read_excel(tracker_path, sheet_name=None, engine="openpyxl")
     cleaned: dict[str, pd.DataFrame] = {}
+    all_serial_cols: list[tuple[str, str]] = []
     for name, df in sheets.items():
         df = _normalize_columns(df)
+        # Detect serial-date columns BEFORE converting (check raw dtypes)
+        for col in df.columns:
+            if _looks_like_date_column(col) and _is_plausible_excel_serial_series(df[col]):
+                all_serial_cols.append((name, col))
         df, log_lines = convert_serial_date_columns(df, name)
         for line in log_lines:
             print(line, file=sys.stderr)
         cleaned[name] = df
-    return cleaned
+    return cleaned, all_serial_cols
 
 
 def load_dashboard(dashboard_path: Path) -> pd.DataFrame:
@@ -121,7 +125,9 @@ def load_dashboard(dashboard_path: Path) -> pd.DataFrame:
 
 
 def load_pack(tracker_path: Path, dashboard_path: Path) -> LoadedPack:
+    tracker_sheets, serial_cols = load_tracker(tracker_path)
     return LoadedPack(
-        tracker_sheets=load_tracker(tracker_path),
+        tracker_sheets=tracker_sheets,
         dashboard=load_dashboard(dashboard_path),
+        serial_date_columns=serial_cols,
     )

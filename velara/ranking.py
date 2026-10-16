@@ -1,23 +1,33 @@
 """Ranking and output formatting.
 
-Combines rule findings and per-country slippage data into the final
-"risk_ranking" list (rank 1 = worst), and assembles the final payload
-dict with "findings" and "risk_ranking" keys per the output contract.
-
-Ranking order (what makes one country "worse" than another) is not
-implemented yet — it depends on slippage.compute_slippage, which is
-itself a stub pending confirmed domain rules.
+Rank by impact descending, ties broken by slippage descending then
+country name ascending. All countries appear once with unique ranks
+1..N. Zero-slippage countries get driver NONE.
 """
 from __future__ import annotations
 
+from .slippage import CountrySlippage
+
+
+def build_risk_ranking(slippage_by_country: dict[str, CountrySlippage]) -> list[dict]:
+    ordered = sorted(
+        slippage_by_country.values(),
+        key=lambda s: (-s.impact_score, -s.slippage_days, s.country),
+    )
+    return [
+        {
+            "country": s.country,
+            "rank": idx + 1,
+            "slippage_days": s.slippage_days,
+            "impact_score": int(s.impact_score),
+            "driver": s.driver,
+            "evidence": s.evidence,
+        }
+        for idx, s in enumerate(ordered)
+    ]
+
 
 def build_clean_ranking(countries: list[str]) -> list[dict]:
-    """Build an all-clean risk_ranking for the given countries.
-
-    Every country gets slippage_days 0, impact_score 0, driver "NONE".
-    Rank order among clean countries is arbitrary (alphabetical) since
-    there is nothing to differentiate them by.
-    """
     ordered = sorted(countries)
     return [
         {
